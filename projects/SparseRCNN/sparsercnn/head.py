@@ -76,11 +76,15 @@ class DynamicHead(nn.Module):
         pooler_type = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
 
         # If StandardROIHeads is applied on multiple feature maps (as in FPN),
+        # 如果标准的ROIHead 被运用在多重特征图
         # then we share the same predictors and therefore the channel counts must be the same
+        # 我们共享所有的预测 因此 通道数必须一样
         in_channels = [input_shape[f].channels for f in in_features]
         # Check all channel counts are equal
+        # 检查所有通道数是一样的
         assert len(set(in_channels)) == 1, in_channels
-
+        # 无序不重复集合 in_channels
+        # box_pooler类 ：输入尺寸，尺寸，sampling_ratio,池化类型
         box_pooler = ROIPooler(
             output_size=pooler_resolution,
             scales=pooler_scales,
@@ -90,27 +94,31 @@ class DynamicHead(nn.Module):
         return box_pooler
 
     def forward(self, features, init_bboxes, init_features):
-
+        # 预测类别和框
         inter_class_logits = []
         inter_pred_bboxes = []
-
+        # 此处bs应该为batchsize
         bs = len(features[0])
+        # 框为初始化的框
         bboxes = init_bboxes
-        
+        # 初始化features 重复batchsize次 proposal_features 也一开始等于init
         init_features = init_features[None].repeat(1, bs, 1)
         proposal_features = init_features.clone()
         
         for rcnn_head in self.head_series:
+            # 重复100次 得到分类 预测框 和 proposal features
             class_logits, pred_bboxes, proposal_features = rcnn_head(features, bboxes, proposal_features, self.box_pooler)
-
+            # 若使用深监督学习，将每个得到的分类和预测框塞入
             if self.return_intermediate:
                 inter_class_logits.append(class_logits)
                 inter_pred_bboxes.append(pred_bboxes)
+            # 剥离 预测出来的框 继续进行预测
             bboxes = pred_bboxes.detach()
 
         if self.return_intermediate:
+            # 创造新维度将得到的预测分类和框堆叠输出.
             return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes)
-
+        # 若是不采用深监督学习，直接返回最后的分类和预测框
         return class_logits[None], pred_bboxes[None]
 
 
@@ -119,36 +127,44 @@ class RCNNHead(nn.Module):
     def __init__(self, cfg, d_model, num_classes, dim_feedforward=2048, nhead=8, dropout=0.1, activation="relu",
                  scale_clamp: float = _DEFAULT_SCALE_CLAMP, bbox_weights=(2.0, 2.0, 1.0, 1.0)):
         super().__init__()
-
+        # 模型输入的纬度
         self.d_model = d_model
 
         # dynamic.
+        # 多头attention
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # 动态Conv
         self.inst_interact = DynamicConv(cfg)
 
+        # linear1 -> dropout -> linear2
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
-
+        # 三个正则化
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
+        # 三次dropout
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
-
+        # 选择使用的激活函数
         self.activation = _get_activation_fn(activation)
 
         # cls.
+        # 分类侧的网络
         num_cls = cfg.MODEL.SparseRCNN.NUM_CLS
+        # 创造网络列表
         cls_module = list()
         for _ in range(num_cls):
+            # linear -> 层正则 -> relu激活
             cls_module.append(nn.Linear(d_model, d_model, False))
             cls_module.append(nn.LayerNorm(d_model))
             cls_module.append(nn.ReLU(inplace=True))
         self.cls_module = nn.ModuleList(cls_module)
 
         # reg.
+        # 创造回归网络列表
         num_reg = cfg.MODEL.SparseRCNN.NUM_REG
         reg_module = list()
         for _ in range(num_reg):
@@ -158,20 +174,25 @@ class RCNNHead(nn.Module):
         self.reg_module = nn.ModuleList(reg_module)
         
         # pred.
+        # 使用focal loss
         self.use_focal = cfg.MODEL.SparseRCNN.USE_FOCAL
         if self.use_focal:
             self.class_logits = nn.Linear(d_model, num_classes)
         else:
+            # 若不使用focal loss 需要加上一个类别 背景
             self.class_logits = nn.Linear(d_model, num_classes + 1)
+        # 最后线性映射到个数
         self.bboxes_delta = nn.Linear(d_model, 4)
+        # 尺寸裁剪
         self.scale_clamp = scale_clamp
+        # bbox weight (2,2,1,1) ？ 这是干什么的？
         self.bbox_weights = bbox_weights
 
 
     def forward(self, features, bboxes, pro_features, pooler):
         """
-        :param bboxes: (N, nr_boxes, 4)
-        :param pro_features: (N, nr_boxes, d_model)
+        :param bboxes: (N, nr_boxes, 4)  N 应该是bs nr_boes 应该是框的权重 4 是x,y,w,h
+        :param pro_features: (N, nr_boxes, d_model) proposal feature  推荐特征？d_model = 512
         """
 
         N, nr_boxes = bboxes.shape[:2]
@@ -180,6 +201,7 @@ class RCNNHead(nn.Module):
         proposal_boxes = list()
         for b in range(N):
             proposal_boxes.append(Boxes(bboxes[b]))
+        # proposal boxes 取出来 放到pooler里
         roi_features = pooler(features, proposal_boxes)            
         roi_features = roi_features.view(N * nr_boxes, self.d_model, -1).permute(2, 0, 1)        
 
